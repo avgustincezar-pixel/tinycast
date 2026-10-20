@@ -1,0 +1,46 @@
+name: Test build
+
+# A side-by-side "Tinycast Test" app, ad-hoc signed, so a fix can be tried without Xcode.
+on:
+  push:
+    branches: [fix/palette-typing-lag]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode 26
+        run: |
+          XCODE_PATH="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n1)"
+          if [ -z "$XCODE_PATH" ]; then
+            echo "::error::No Xcode 26.x found on this runner."
+            ls /Applications | grep -i xcode || true
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$XCODE_PATH/Contents/Developer" >> "$GITHUB_ENV"
+
+      - name: Build app
+        run: |
+          xcodebuild -project Tinycast.xcodeproj -scheme Tinycast -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" \
+            OTHER_CODE_SIGN_FLAGS="--timestamp=none" \
+            PRODUCT_NAME="Tinycast Test" TINYCAST_BUNDLE_IDENTIFIER="com.tinycast.app.test" \
+            build
+
+      - name: Zip app
+        run: |
+          APP="$(find "$RUNNER_TEMP/DerivedData/Build/Products/Release" -maxdepth 1 -name '*.app' | head -n1)"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/Tinycast-Test.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tinycast-Test
+          path: ${{ runner.temp }}/Tinycast-Test.zip
