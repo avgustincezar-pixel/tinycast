@@ -307,10 +307,15 @@ struct RootPaletteView: View {
         let showActionGroup =
             (count > 0 || screen.actsWithoutRows)
             && screen.hasPrimaryAction(at: sel)
+        // Every read of `screen` is a list build, so the header gets these rather than asking again.
+        let chrome = HeaderChrome(
+            accessory: isCollapsed ? nil : screen.headerAccessory(at: sel, focus: $argumentFocused),
+            hidesSearchField: !isCollapsed && screen.hidesSearchField)
 
         // One header position, so focus survives the swap. See docs/features/palette.md.
         return keyHandlers(
             stateObservers(
+                rendered: screen, hidesSearchField: chrome.hidesSearchField,
                 Group {
                     if isCollapsed {
                         Color.clear
@@ -318,7 +323,7 @@ struct RootPaletteView: View {
                         screen.body(selection: sel, scroll: scroll)
                     }
                 }
-                .safeAreaInset(edge: .top, spacing: 0) { header }
+                .safeAreaInset(edge: .top, spacing: 0) { header(screen: screen, chrome: chrome) }
                 .safeAreaInset(edge: .bottom, spacing: 0) {
                     if !isCollapsed {
                         bottomBar(
@@ -358,11 +363,11 @@ struct RootPaletteView: View {
 
     /// The emoji grid's observers, split out so `stateObservers` stays within type-checker reach.
     @ViewBuilder
-    private func emojiObservers(_ content: some View) -> some View {
+    private func emojiObservers(_ content: some View, rendered: any PaletteScreen) -> some View {
         content
             .onChange(of: vm.emojiCategoryFilter) { land() }
             .onChange(of: core.pinnedEmoji.revision) { emojiGridChanged() }
-            .onChange(of: (screen as? EmojiScreen)?.frequentlyUsed) { old, new in
+            .onChange(of: (rendered as? EmojiScreen)?.frequentlyUsed) { old, new in
                 guard let old, let new else { return }
                 (screen as? EmojiScreen)?.frequentlyUsedChanged(from: old, to: new)
                 emojiGridChanged()
@@ -384,8 +389,10 @@ struct RootPaletteView: View {
 
     /// Split from `body` for the same reason `keyHandlers` is: one chain cannot carry them all.
     @ViewBuilder
-    private func stateObservers(_ content: some View) -> some View {
-        emojiObservers(content)
+    private func stateObservers(
+        rendered: any PaletteScreen, hidesSearchField: Bool, _ content: some View
+    ) -> some View {
+        emojiObservers(content, rendered: rendered)
             // Every show bumps focusToken so the search field refocuses.
             .onChange(of: vm.focusToken) {
                 searchFocused = !screen.hidesSearchField
@@ -666,7 +673,7 @@ struct RootPaletteView: View {
         if hidden { vm.query = "" }
     }
 
-    private var header: some View {
+    private func header(screen: any PaletteScreen, chrome: HeaderChrome) -> some View {
         HStack(alignment: .center, spacing: 0) {
             // Matches the list rows and section headers' own indent below.
             headerGutter(width: metrics.spacing.md * 2)
@@ -684,13 +691,13 @@ struct RootPaletteView: View {
             // slot + xl equals a row's icon + lg, so the query starts where the row titles do.
             headerGutter(width: metrics.spacing.xl)
             // One structural position: a field inside a branch loses first responder when it flips.
-            headerField
-            if let accessory = headerAccessory {
+            headerField(chrome)
+            if let accessory = chrome.accessory {
                 accessory.view
                 // Given room last: at the default priority it would split it with the field.
                 Spacer(minLength: 0).layoutPriority(-1)
             }
-            if tabOpensChat {
+            if tabOpensChat(accessory: chrome.accessory) {
                 headerGutter(width: metrics.spacing.md)
                 quickAITabHint
             }
@@ -796,43 +803,39 @@ struct RootPaletteView: View {
     }
 
     /// Resolved through `PaletteTabAction`, so the hint cannot promise the wrong destination.
-    private var tabOpensChat: Bool {
-        guard !isCollapsed, headerAccessory?.fieldNames.isEmpty ?? true else { return false }
+    private func tabOpensChat(accessory: PaletteHeaderAccessory?) -> Bool {
+        guard !isCollapsed, accessory?.fieldNames.isEmpty ?? true else { return false }
         return PaletteTabAction.resolve(
             mode: vm.mode, aiEnabled: settings.aiEnabled,
             clipboardEnabled: settings.clipboardEnabled) == .ask
     }
 
-    private var hidesSearchField: Bool { !isCollapsed && screen.hidesSearchField }
-
     /// The field, kept mounted and hidden rather than swapped: a branch would tear its editor down.
-    private var headerField: some View {
-        searchField
+    private func headerField(_ chrome: HeaderChrome) -> some View {
+        let prompt = searchPrompt(accessory: chrome.accessory)
+        let width = searchFieldWidth(chrome, prompt: prompt)
+        return searchField(prompt: prompt, hidden: chrome.hidesSearchField)
             // A ceiling, not a size, so the row squeezes a long query before the strip overruns.
-            .frame(minWidth: searchFieldFloor, maxWidth: searchFieldWidth)
-            .opacity(hidesSearchField ? 0 : 1)
-            .allowsHitTesting(!hidesSearchField)
-            .accessibilityHidden(hidesSearchField)
+            .frame(minWidth: width.map { min($0, metrics.size.searchFieldMinWidth) }, maxWidth: width)
+            .opacity(chrome.hidesSearchField ? 0 : 1)
+            .allowsHitTesting(!chrome.hidesSearchField)
+            .accessibilityHidden(chrome.hidesSearchField)
             // The frame it publishes is where the panel puts an I-beam; hidden, it owns nowhere.
-            .onChange(of: hidesSearchField) { _, hidden in
+            .onChange(of: chrome.hidesSearchField) { _, hidden in
                 if hidden { vm.searchFieldFrame = .zero }
             }
     }
 
     /// Fixed only where something shares the row: the accessory strip, or a screen's own title.
-    private var searchFieldWidth: CGFloat? {
-        if hidesSearchField { return nil }
-        return headerAccessory.map(searchFieldWidth)
-    }
-
-    private var searchFieldFloor: CGFloat? {
-        searchFieldWidth.map { min($0, metrics.size.searchFieldMinWidth) }
+    private func searchFieldWidth(_ chrome: HeaderChrome, prompt: String) -> CGFloat? {
+        if chrome.hidesSearchField { return nil }
+        return chrome.accessory.map { searchFieldWidth(for: $0, prompt: prompt) }
     }
 
     /// Capped to keep the strip on screen; empty, it measures the prompt so the strip follows it.
-    private func searchFieldWidth(for accessory: PaletteHeaderAccessory) -> CGFloat {
+    private func searchFieldWidth(for accessory: PaletteHeaderAccessory, prompt: String) -> CGFloat {
         let font = metrics.typography.searchFieldNSFont
-        let text = vm.query.isEmpty ? searchPrompt : vm.query
+        let text = vm.query.isEmpty ? prompt : vm.query
         let typed = (text as NSString).size(withAttributes: [.font: font]).width
         let chrome = metrics.size.headerIconSlot + metrics.spacing.md * 3 + metrics.spacing.xl
         let room = metrics.size.panelWidth - accessory.width - chrome
@@ -842,9 +845,9 @@ struct RootPaletteView: View {
             max(room, metrics.size.searchFieldMinWidth))
     }
 
-    private var searchPrompt: String {
+    private func searchPrompt(accessory: PaletteHeaderAccessory?) -> String {
         // Squeezed to the caret, the field has no room for a prompt; beside one it keeps it.
-        if headerAccessory?.placement == .afterQuery, vm.mode != .ai { return "" }
+        if accessory?.placement == .afterQuery, vm.mode != .ai { return "" }
         if vm.mode == .extensionCommand, let placeholder = extensionScreen.searchPlaceholder {
             return placeholder
         }
@@ -852,7 +855,7 @@ struct RootPaletteView: View {
     }
 
     /// The one search field — empty it's a drag handle, and any text hands every press to editing.
-    private var searchField: some View {
+    private func searchField(prompt searchPrompt: String, hidden hidesSearchField: Bool) -> some View {
         @Bindable var vm = vm
         return TextField("", text: $vm.query)
             .textFieldStyle(.plain)
@@ -1262,6 +1265,7 @@ struct RootPaletteView: View {
     /// Every reset lands here, so handlers that fire together agree in whatever order they run.
     private func land(restoringSelection: Bool = false) {
         let restored = restoringSelection ? vm.restoredSelection : nil
+        let screen = screen
         let landing = restored.map { min($0, max(screen.rows.count - 1, 0)) } ?? screen.landingSelection
         vm.selection = landing
         scroll = ScrollIntent(kind: restored != nil ? .follow : landing == 0 ? .top : .center)
@@ -1484,6 +1488,12 @@ private enum OpenMenu: Equatable {
     case aiModel
     case aiReasoning
     case aiAttachments
+}
+
+/// What the header asks of the screen, resolved with it so a keystroke builds the list once.
+private struct HeaderChrome {
+    let accessory: PaletteHeaderAccessory?
+    let hidesSearchField: Bool
 }
 
 /// Reads visibility in its own body, so a summon never re-renders the palette's.
