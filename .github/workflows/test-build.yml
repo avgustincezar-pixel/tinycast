@@ -3,11 +3,11 @@ name: Test build
 # A side-by-side "Tinycast Test" app, ad-hoc signed, so a fix can be tried without Xcode.
 on:
   push:
-    branches: [fix/palette-typing-lag]
+    branches: [fix/palette-typing-lag, feat/clipboard-screenshots]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -35,12 +35,28 @@ jobs:
             PRODUCT_NAME="Tinycast Test" TINYCAST_BUNDLE_IDENTIFIER="com.tinycast.app.test" \
             build
 
-      - name: Zip app
+      # A DMG keeps the bundle's symlinks and exec bits, which a zipped artifact can mangle.
+      - name: Make DMG
         run: |
           APP="$(find "$RUNNER_TEMP/DerivedData/Build/Products/Release" -maxdepth 1 -name '*.app' | head -n1)"
-          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/Tinycast-Test.zip"
+          STAGE="$RUNNER_TEMP/dmg"
+          mkdir -p "$STAGE"
+          ditto "$APP" "$STAGE/$(basename "$APP")"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "Tinycast Test" -srcfolder "$STAGE" -ov -format UDZO \
+            "$RUNNER_TEMP/Tinycast-Test.dmg"
 
       - uses: actions/upload-artifact@v4
         with:
           name: Tinycast-Test
-          path: ${{ runner.temp }}/Tinycast-Test.zip
+          path: ${{ runner.temp }}/Tinycast-Test.dmg
+
+      - name: Publish pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="test-${GITHUB_REF_NAME//\//-}-${GITHUB_RUN_NUMBER}"
+          gh release create "$TAG" "$RUNNER_TEMP/Tinycast-Test.dmg" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
+            --title "Tinycast Test ($GITHUB_REF_NAME #$GITHUB_RUN_NUMBER)" \
+            --notes "Unsigned test build of $GITHUB_REF_NAME at $GITHUB_SHA."

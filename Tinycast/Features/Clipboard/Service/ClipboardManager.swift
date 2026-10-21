@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 @MainActor
 final class ClipboardManager {
@@ -19,6 +20,7 @@ final class ClipboardManager {
     private var lastChangeCount = 0
     private var isCapturing = false
     private var isCapturePaused = false
+    private lazy var screenshots = ScreenshotWatcher { [weak self] url in self?.addScreenshot(url) }
 
     init(store: ClipboardStore, settings: AppSettings) {
         self.store = store
@@ -35,12 +37,30 @@ final class ClipboardManager {
         isCapturing = true
         installSessionObservers()
         startPolling()
+        screenshots.start()
     }
 
     func stop() {
         isCapturing = false
         sessionTokens = []
         stopPolling()
+        screenshots.stop()
+    }
+
+    private func addScreenshot(_ url: URL) {
+        guard isCapturing else { return }
+        let sourceBundleID = ScreenshotWatcher.sourceBundleID
+        if settings.clipboardDisabledApps.contains(sourceBundleID) { return }
+        let store = store
+        Task.detached(priority: .utility) {
+            guard let data = try? Data(contentsOf: url) else { return }
+            let png =
+                UTType(filenameExtension: url.pathExtension) == .png
+                ? data
+                : NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:])
+            guard let png else { return }
+            await store.addImage(png, sourceBundleID: sourceBundleID)
+        }
     }
 
     // Fast user switching: another session's clipboard isn't ours, so stop waking up for it.
@@ -173,6 +193,71 @@ final class ClipboardManager {
                 guard let png else { return }
                 await store.addImage(png, sourceBundleID: sourceBundleID)
             }
+        }
+    }
+}
+
+/// ⌘⇧3/⌘⇧4 save to disk without touching the pasteboard, so Spotlight's capture flag finds them.
+@MainActor
+final class ScreenshotWatcher {
+    /// Screenshot.app, so the row credits the system screenshot tool as its source.
+    static let sourceBundleID = "com.apple.screenshot.launcher"
+
+    private let onScreenshot: (URL) -> Void
+    private var query: NSMetadataQuery?
+    private var token: NotificationToken?
+    private var startedAt = Date.distantFuture
+    private var seen: Set<String> = []
+
+    init(onScreenshot: @escaping (URL) -> Void) {
+        self.onScreenshot = onScreenshot
+    }
+
+    isolated deinit {
+        query?.stop()
+    }
+
+    func start() {
+        guard query == nil else { return }
+        let query = NSMetadataQuery()
+        query.predicate = NSPredicate(format: "%K == 1", "kMDItemIsScreenCapture")
+        query.searchScopes = [NSMetadataQueryUserHomeScope]
+        // Only captures made from now on: the initial gather is the user's whole screenshot past.
+        startedAt = Date()
+        token = NotificationToken(
+            NotificationCenter.default.addObserver(
+                forName: .NSMetadataQueryDidUpdate, object: query, queue: .main
+            ) { [weak self] note in
+                let keys = [NSMetadataQueryUpdateAddedItemsKey, NSMetadataQueryUpdateChangedItemsKey]
+                let found = keys.flatMap { note.userInfo?[$0] as? [NSMetadataItem] ?? [] }
+                    .compactMap { item -> (String, Date)? in
+                        guard let path = item.value(forAttribute: NSMetadataItemPathKey) as? String,
+                            let created = item.value(forAttribute: NSMetadataItemFSCreationDateKey)
+                                as? Date
+                        else { return nil }
+                        return (path, created)
+                    }
+                MainActor.assumeIsolated { self?.receive(found) }
+            }, center: .default)
+        query.start()
+        self.query = query
+    }
+
+    func stop() {
+        query?.stop()
+        query = nil
+        token = nil
+        seen = []
+    }
+
+    private func receive(_ found: [(String, Date)]) {
+        for (path, created) in found where created >= startedAt && !seen.contains(path) {
+            let url = URL(fileURLWithPath: path)
+            // Screen recordings carry the same flag; only stills belong in the history.
+            guard UTType(filenameExtension: url.pathExtension)?.conforms(to: .image) == true
+            else { continue }
+            seen.insert(path)
+            onScreenshot(url)
         }
     }
 }

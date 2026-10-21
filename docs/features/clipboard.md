@@ -95,6 +95,19 @@ nothing else can put it back. **Clear history stays live with the feature off** 
 `ClipboardCoordinator.clearHistory()` reopens the file, clears the unpinned rows and closes it again — so a reader
 who turns the feature off can still erase what it kept.
 
+## Saved screenshots
+
+⌘⇧3 and ⌘⇧4 write a file and leave the pasteboard alone, so the poller never sees them.
+`ScreenshotWatcher` (beside `ClipboardManager`, started and stopped with it) runs a live
+`NSMetadataQuery` for `kMDItemIsScreenCapture == 1` across the home folder, which finds a capture
+wherever the screenshot location points without reading `com.apple.screencapture`. Only items
+created after the query started count, so the initial gather never floods the history with old
+screenshots, and screen recordings are dropped because they carry the same flag. Each still is
+copied into the images directory as PNG through `ClipboardStore.addImage`, exactly like a copied
+image, so deleting the file on the Desktop does not empty the row. The source is Screenshot.app
+(`com.apple.screenshot.launcher`), which is also what the disabled-apps list matches to opt out.
+Reading a capture on the Desktop is what triggers macOS's Desktop folder prompt the first time.
+
 ## Store
 
 `ClipboardStore` is SQLite-backed: rows plus a trigram FTS5 index in `clipboard.sqlite3`, with image
