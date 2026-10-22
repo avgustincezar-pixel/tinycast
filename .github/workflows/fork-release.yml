@@ -1,0 +1,105 @@
+name: Fork release
+
+run-name: "Tinycast 0.13.${{ github.run_number }}"
+
+# Every push to main becomes a stable release the installed app offers through Check for Updates.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "website/**"
+      - "**.md"
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: Runner label, for when one macOS pool is out of capacity
+        default: macos-26-intel
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner || 'macos-26-intel' }}
+    env:
+      VERSION: 0.13.${{ github.run_number }}
+      DISPLAY_NAME: Tinycast
+      BUNDLE_ID: com.tinycast.app
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select Xcode 26
+        run: |
+          XCODE_PATH="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n1)"
+          if [ -z "$XCODE_PATH" ]; then
+            echo "::error::No Xcode 26.x found on this runner."
+            ls /Applications | grep -i xcode || true
+            exit 1
+          fi
+          echo "DEVELOPER_DIR=$XCODE_PATH/Contents/Developer" >> "$GITHUB_ENV"
+
+      # The SAME cert on every release is what keeps the Accessibility grant across updates.
+      - name: Import signing certificate
+        env:
+          P12_BASE64: ${{ secrets.SIGNING_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
+        run: |
+          if [ -z "$P12_BASE64" ] || [ -z "$P12_PASSWORD" ]; then
+            echo "::error::SIGNING_P12_BASE64 and SIGNING_P12_PASSWORD secrets are required."
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KPW="$(openssl rand -base64 24)"
+          echo "${P12_BASE64}" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KPW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KPW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "${P12_PASSWORD}" -A -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed 's/"//g')
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build app
+        run: |
+          xcodebuild -project Tinycast.xcodeproj -scheme Tinycast -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Tinycast Self-Signed" \
+            OTHER_CODE_SIGN_FLAGS="--timestamp=none" \
+            PRODUCT_NAME="$DISPLAY_NAME" TINYCAST_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            build
+
+      - name: Assert the signature
+        run: ./Scripts/verify-signature.sh "$RUNNER_TEMP/DerivedData/Build/Products/Release/${DISPLAY_NAME}.app"
+
+      # The zip is for the in-app updater; only `ditto` keeps the signature verifiable.
+      - name: Package DMG and ZIP
+        run: |
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Release/${DISPLAY_NAME}.app"
+          STAGE="$(mktemp -d)"
+          ditto "$APP" "$STAGE/${DISPLAY_NAME}.app"
+          ln -s /Applications "$STAGE/Applications"
+          mkdir -p dist
+          hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$STAGE" -ov -format UDZO "dist/Tinycast-${VERSION}.dmg"
+          ditto -c -k --keepParent --sequesterRsrc "$APP" "dist/Tinycast-${VERSION}.zip"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            git log -1 --format='%s%n%n%b' "$GITHUB_SHA"
+            echo
+            echo "<!-- tinycast:install -->"
+            echo "Built from $GITHUB_SHA."
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "v${VERSION}" \
+            "dist/Tinycast-${VERSION}.dmg" "dist/Tinycast-${VERSION}.zip" \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Tinycast ${VERSION}" --notes-file "$RUNNER_TEMP/notes.md"

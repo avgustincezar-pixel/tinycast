@@ -2,8 +2,6 @@ name: Test build
 
 # A side-by-side "Tinycast Test" app, ad-hoc signed, so a fix can be tried without Xcode.
 on:
-  push:
-    branches: [fix/palette-typing-lag, feat/clipboard-screenshots]
   workflow_dispatch:
     inputs:
       runner:
